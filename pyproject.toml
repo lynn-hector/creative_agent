@@ -1,0 +1,18 @@
+[project]
+name = "creative-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "pydantic>=2.0.0",
+    "python-jose[cryptography]>=3.3.0",
+    "redis>=5.0.0",
+    "motor>=3.3.0",
+    "langchain-core>=0.1.0",
+    "langgraph>=0.0.40",
+    "cryptography>=41.0.0",
+    "python-multipart>=0.0.6"
+]
