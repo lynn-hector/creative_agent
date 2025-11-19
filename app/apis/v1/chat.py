@@ -1,12 +1,13 @@
 import json
 import uuid
 import time
+import asyncio
+import logging
 from typing import AsyncGenerator
 
 from fastapi import Depends
 from fastapi import Request
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from app.schemas.chat import ChatV1Request
 from fastapi.responses import StreamingResponse
@@ -16,6 +17,8 @@ from app.services.response import ResponseCode, get_error_message
 from app.settings import settings
 from app.core.agent_factory.orchestrator import Orchestrator
 from . import router
+from ...core.pg_pool_context_manager import pg_hybrid
+
 
 @router.post("/chat/stream")
 async def stream_chat_v1(request: Request, param: ChatV1Request,
@@ -49,21 +52,9 @@ async def stream_chat_v1(request: Request, param: ChatV1Request,
     # 创建响应流
     async def response_stream() -> AsyncGenerator[str, None]:
         try:
-            # # ✅ 复用 Agent（从池中获取，不每次创建）
-            # agent = await agent_pool.get_agent(
-            #     prompt_preset="default",  # 可以从请求参数获取
-            #     llm_config="deepseek_reasoner"  # 可以从请求参数获取
-            # )
-            #
-            from langgraph.checkpoint.postgres import PostgresSaver
-            sql_uri = settings.POSTGRESQL_URI
-
-            # 使用异步上下文管理器初始化checkpointer
-            async with AsyncPostgresSaver.from_conn_string(sql_uri) as checkpointer:
-                # 确保checkpointer已正确初始化
-                await checkpointer.setup()
+            async with pg_hybrid.context() as checkpointer:
+                # checkpointer = await pg_hybrid.get_saver()
                 agent = await create_chat_agent(checkpointer)
-                # ✅ 复用 agent 的 stream_process 方法（更简洁）
                 original_stream = agent.stream_process(param, config=config)
 
                 # 包装为可取消的流（5分钟超时）
@@ -77,11 +68,42 @@ async def stream_chat_v1(request: Request, param: ChatV1Request,
                 ):
                     yield chunk
 
-        except Exception as e:
-            import logging
+        except asyncio.TimeoutError:
             logger = logging.getLogger(__name__)
-            logger.error(f"Error in stream_chat_v1: {e}", exc_info=True)
-            
+            logger.error(f"Request timeout for conversation {param.conversation_id}")
+            timeout_response = {
+                "conversation_id": param.conversation_id,
+                "type": "error",
+                "object": "realtime.error",
+                "created": int(time.time()),
+                "error": [{
+                    "code": ResponseCode.TIMEOUT_ERROR,
+                    "message": get_error_message(ResponseCode.TIMEOUT_ERROR),
+                    "type": "timeout_error"
+                }]
+            }
+            yield f"data: {json.dumps(timeout_response, ensure_ascii=False)}\n\n"
+
+        except ConnectionError as e:
+            logger = logging.getLogger(__name__)
+            logger.error(f"Connection error for conversation {param.conversation_id}: {e}")
+            connection_error_response = {
+                "conversation_id": param.conversation_id,
+                "type": "error",
+                "object": "realtime.error",
+                "created": int(time.time()),
+                "error": [{
+                    "code": ResponseCode.CONNECTION_ERROR,
+                    "message": get_error_message(ResponseCode.CONNECTION_ERROR),
+                    "type": "connection_error"
+                }]
+            }
+            yield f"data: {json.dumps(connection_error_response, ensure_ascii=False)}\n\n"
+
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.error(f"Unexpected error in stream_chat_v1 for conversation {param.conversation_id}: {e}", exc_info=True)
+
             error_response = {
                 "conversation_id": param.conversation_id,
                 "type": "error",
@@ -90,7 +112,8 @@ async def stream_chat_v1(request: Request, param: ChatV1Request,
                 "error": [{
                     "code": ResponseCode.SYSTEM_ERROR,
                     "message": get_error_message(ResponseCode.SYSTEM_ERROR),
-                    "type": "system_err"
+                    "type": "system_err",
+                    "details": str(e) if settings.DEBUG else None  # 仅在DEBUG模式下显示详细错误信息
                 }]
             }
             yield f"data: {json.dumps(error_response, ensure_ascii=False)}\n\n"

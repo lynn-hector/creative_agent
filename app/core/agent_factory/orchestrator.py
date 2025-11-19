@@ -12,6 +12,7 @@ from app.core.msg_manage import message_enum
 from app.core.msg_manage.ds import parse_ds_message_chunk_v2
 from app.schemas.chat import ChatV1Request
 from app.services.response import ResponseCode, get_error_message
+from app.settings import settings
 
 
 class Orchestrator:
@@ -20,11 +21,20 @@ class Orchestrator:
         self.desc = desc
         self.graph = None
         self.tools = []
+
+        # 使用settings中的API密钥，提供回退机制
+        api_key = settings.DEEPSEEK_API_KEY
+        if not api_key:
+            raise ValueError("DEEPSEEK_API_KEY is not configured in environment variables")
+
+        base_url = settings.DEEPSEEK_API_BASE or "https://api.deepseek.com/v1"
+        model_name = settings.DEEPSEEK_MODEL or "deepseek:deepseek-reasoner"
+
         self.llm = init_chat_model(
-                        model="deepseek:deepseek-reasoner",
+                        model=model_name,
                         temperature=0,
-                        base_url="https://api.deepseek.com/v1",
-                        api_key="sk-759ff171d9144ca6861f1c89a9f3976b"
+                        base_url=base_url,
+                        api_key=api_key
                     )
 
     async def create_graph(self, checkpointer, system_prompt: str = None):
