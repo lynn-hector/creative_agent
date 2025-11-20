@@ -28,7 +28,7 @@ async def stream_chat_v1(request: Request, param: ChatV1Request,
     if param.type == "create" or param.conversation_id is None:
         conversation_id = str(uuid.uuid4())
         param.conversation_id = conversation_id
-        # 保存user_id和thread_id到MongoDB
+        # 保存user_id和thread_id到pg
         # mongo_client = request.app.state.mongo_client
         # db = mongo_client[settings.MONGODB_DB_NAME]
         # collection = db["user_conversion"]

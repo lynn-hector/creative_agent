@@ -1,18 +1,21 @@
 import asyncio
-import uuid
-import time
-from typing import Dict, AsyncGenerator, Any
+import logging
+from typing import AsyncGenerator, Dict
 
 from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage
-from langchain.agents.middleware import HumanInTheLoopMiddleware
 
-from app.core.msg_manage import message_enum
-from app.core.msg_manage.ds import parse_ds_message_chunk_v2
+from app.core.agent_factory.streaming import (
+    LangGraphMessageAdapter,
+    ResponseBuilder,
+    StreamContext,
+)
 from app.schemas.chat import ChatV1Request
 from app.services.response import ResponseCode, get_error_message
 from app.settings import settings
+
+logger = logging.getLogger(__name__)
 
 
 class Orchestrator:
@@ -22,7 +25,6 @@ class Orchestrator:
         self.graph = None
         self.tools = []
 
-        # 使用settings中的API密钥，提供回退机制
         api_key = settings.DEEPSEEK_API_KEY
         if not api_key:
             raise ValueError("DEEPSEEK_API_KEY is not configured in environment variables")
@@ -31,20 +33,25 @@ class Orchestrator:
         model_name = settings.DEEPSEEK_MODEL or "deepseek:deepseek-reasoner"
 
         self.llm = init_chat_model(
-                        model=model_name,
-                        temperature=0,
-                        base_url=base_url,
-                        api_key=api_key
-                    )
+            model=model_name,
+            temperature=0,
+            base_url=base_url,
+            api_key=api_key,
+        )
 
-    async def create_graph(self, checkpointer, system_prompt: str = None):
-        # 确保tools是扁平化的列表
-        flat_tools = []
-        for tool in self.tools:
-            if isinstance(tool, list):
-                flat_tools.extend(tool)
-            else:
-                flat_tools.append(tool)
+        self._message_adapter = LangGraphMessageAdapter()
+        self._response_builder = ResponseBuilder()
+
+    def reset_tools(self, tools):
+        self.tools = []
+        if tools:
+            self.register_tool(tools)
+
+    async def create_graph(self, checkpointer, system_prompt: str = None, tools=None):
+        if tools is not None:
+            self.reset_tools(tools)
+
+        flat_tools = self._flatten_tools(self.tools)
 
         self.graph = create_agent(
             model=self.llm,
@@ -59,133 +66,40 @@ class Orchestrator:
         else:
             self.tools.append(tool)
 
+    def _flatten_tools(self, tools):
+        if not tools:
+            return []
+        flat_tools = []
+        for tool in tools:
+            if isinstance(tool, list):
+                flat_tools.extend(tool)
+            else:
+                flat_tools.append(tool)
+        return flat_tools
 
     async def stream_process(self, request: ChatV1Request, config: Dict = None) -> AsyncGenerator[Dict, None]:
-        seq = 0
+        context = StreamContext(request.conversation_id)
         try:
             async for agent_info, message_chunk in self.graph.astream(
-                    input={"messages": [HumanMessage(content=request.message)]},
-                    config=config,
-                    stream_mode="messages",
-                    subgraphs=True,
+                input={"messages": [HumanMessage(content=request.message)]},
+                config=config,
+                stream_mode="messages",
+                subgraphs=True,
             ):
-                # todo: 检查取消状态，管理取消机制
-
-                if not message_chunk or len(message_chunk) == 0:
+                payload = self._message_adapter.adapt(agent_info, message_chunk)
+                if not payload:
                     continue
-
-                message = message_chunk[0]
-                msg_type = message.__class__.__name__
-                response_source = message_enum.Role_Type_System_LLM
-                response_name = str(uuid.uuid4())
-                if agent_info and len(agent_info) > 0:
-                    response_name = agent_info[0]
-
-                if len(agent_info) > 0:
-                    agent_sources = response_name.split(":")
-                    if len(agent_sources) > 1:
-                        response_source = agent_sources[0]
-
-                conversation_type, content_type, content = parse_ds_message_chunk_v2(message, response_source)
-
-                # 检查是否为尾包或完成状态
-                is_completion = conversation_type in [
-                    message_enum.RESPONSE_STATUS_TYPE_COMPLETION,
-                    message_enum.RESPONSE_STATUS_TYPE_DONE
-                ]
-
-                # 对于尾包，保持与前一个消息相同的序列号
-                if is_completion and seq > 0:
-                    current_seq = seq  # 保持当前序列号
-                elif conversation_type != message_enum.RESPONSE_STATUS_TYPE_CREATED:
-                    seq += 1
-                    current_seq = seq
-                else:
-                    current_seq = seq
-
-                # 首包特殊处理
-                if seq == 1 and conversation_type != message_enum.RESPONSE_STATUS_TYPE_CREATED:
-                    conversation_type = message_enum.RESPONSE_STATUS_TYPE_FIRST
-
-                # 确保尾包有正确的内容
-                if is_completion and not content:
-                    content = ""  # 尾包可以是空内容
-
-                if content or conversation_type in [
-                    message_enum.RESPONSE_STATUS_TYPE_CREATED,
-                    message_enum.RESPONSE_STATUS_TYPE_FIRST,
-                    message_enum.RESPONSE_STATUS_TYPE_DELTA,
-                    message_enum.RESPONSE_STATUS_TYPE_COMPLETION
-                ]:
-                    print(f"[{conversation_type}] {content}", flush=True)
-
-                yield self._build_response(request.conversation_id, seq, conversation_type, response_source,
-                                            content_type, response_name, content, "text")
+                yield self._response_builder.build_message(context, payload)
         except asyncio.CancelledError:
-            yield self._build_cancel_response(request.conversation_id)
+            yield self._response_builder.build_cancel(request.conversation_id)
             return
-        except Exception as e:
-            yield self._build_error_resp(request.conversation_id, ResponseCode.SYSTEM_ERROR.value,
-                                          get_error_message(ResponseCode.SYSTEM_ERROR), "")
+        except Exception:
+            logger.exception("Orchestrator stream error for %s", request.conversation_id)
+            yield self._response_builder.build_error(
+                request.conversation_id,
+                ResponseCode.SYSTEM_ERROR.value,
+                get_error_message(ResponseCode.SYSTEM_ERROR),
+                "",
+            )
         finally:
-
-            yield self._build_response(request.conversation_id, -1, message_enum.RESPONSE_STATUS_TYPE_DONE,
-                                        message_enum.Role_Type_System_LLM,
-                                        message_enum.ConversationResponseInnerContentTypeMap["done"], "", "", "text")
-
-
-
-    def _build_response(
-            self,
-            conversation_id: str,
-            seq: int,
-            conversation_type: str,
-            response_source: str,
-            response_type: str,
-            response_name: str,
-            content: str = "",
-            content_type: str = "",
-    ) -> Dict[str, Any]:
-        return {
-            "conversation_id": conversation_id,
-            "created": int(time.time()),
-            "seq": seq,
-            "role": message_enum.Role_Type_System,  # 可根据需要替换为统一的 message_enum.Role_Type_System
-            "type": conversation_type,
-            "object": "realtime.response",
-            "response": [{
-                "id": 0,
-                "source": response_source,
-                "type": response_type,
-                "name": response_name,
-                "output": [
-                    {
-                        "type": content_type,
-                        "content": content
-                    }
-                ],
-            }]
-        }
-
-    def _build_cancel_response(self, conversation_id):
-        return {
-            "conversation_id": conversation_id,
-            "type": "cancelled",
-            "object": "realtime.cancelled",
-            "created": int(time.time()),
-            "message": "Stream cancelled by user"
-        }
-
-    def _build_error_resp(self, conversation_id, code, message, err_type):
-        return {
-            "conversation_id": conversation_id,
-            "type": "error",
-            "object": "realtime.error",
-            "created": int(time.time()),
-            "error": [{
-                "code": code,
-                "message": message,
-                "type": err_type
-            }]
-        }
-
+            yield self._response_builder.build_done(request.conversation_id)
