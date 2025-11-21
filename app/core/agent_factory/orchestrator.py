@@ -11,6 +11,7 @@ from app.core.agent_factory.streaming import (
     ResponseBuilder,
     StreamContext,
 )
+from app.core.streaming.events import StreamEvent
 from app.schemas.chat import ChatV1Request
 from app.services.response import ResponseCode, get_error_message
 from app.settings import settings
@@ -20,6 +21,11 @@ logger = logging.getLogger(__name__)
 
 class Orchestrator:
     def __init__(self, name, desc):
+        """
+        Args:
+            name: 协调器名称，用于日志或可视化展示。
+            desc: 协调器描述，帮助外部理解该 orchestrator 的职责。
+        """
         self.name = name
         self.desc = desc
         self.graph = None
@@ -48,6 +54,12 @@ class Orchestrator:
             self.register_tool(tools)
 
     async def create_graph(self, checkpointer, system_prompt: str = None, tools=None):
+        """
+        Args:
+            checkpointer: LangGraph 的检查点存储，用于线程状态恢复。
+            system_prompt: 可选的系统提示词，影响 LLM 行为。
+            tools: 额外工具列表；若提供则覆盖现有注册的工具。
+        """
         if tools is not None:
             self.reset_tools(tools)
 
@@ -77,8 +89,12 @@ class Orchestrator:
                 flat_tools.append(tool)
         return flat_tools
 
-    async def stream_process(self, request: ChatV1Request, config: Dict = None) -> AsyncGenerator[Dict, None]:
+    async def stream_process(
+        self, request: ChatV1Request, config: Dict = None
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """驱动 LangGraph astream 并转换为标准化的 StreamEvent。"""
         context = StreamContext(request.conversation_id)
+        should_emit_done = True
         try:
             async for agent_info, message_chunk in self.graph.astream(
                 input={"messages": [HumanMessage(content=request.message)]},
@@ -91,7 +107,8 @@ class Orchestrator:
                     continue
                 yield self._response_builder.build_message(context, payload)
         except asyncio.CancelledError:
-            yield self._response_builder.build_cancel(request.conversation_id)
+            logger.info("Stream for %s cancelled by controller", request.conversation_id)
+            should_emit_done = False
             return
         except Exception:
             logger.exception("Orchestrator stream error for %s", request.conversation_id)
@@ -101,5 +118,7 @@ class Orchestrator:
                 get_error_message(ResponseCode.SYSTEM_ERROR),
                 "",
             )
+            should_emit_done = False
         finally:
-            yield self._response_builder.build_done(request.conversation_id)
+            if should_emit_done:
+                yield self._response_builder.build_done(request.conversation_id)

@@ -6,6 +6,7 @@ from typing import Optional
 
 from app.core.msg_manage import message_enum
 from app.core.msg_manage.ds import parse_ds_message_chunk_v2
+from app.core.streaming.events import EventType, StreamEvent
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,7 @@ class ResponseBuilder:
     """
 
     def build_message(self, context: StreamContext, payload: MessageAdapterResult):
+        """将 LangGraph 消息块转换为带序列管理的 StreamEvent。"""
         seq = context.next_sequence(payload.conversation_type)
         conversation_type = context.adjust_type_for_first(
             payload.conversation_type, seq
@@ -114,7 +116,7 @@ class ResponseBuilder:
         ]:
             logger.debug("[%s] %s", conversation_type, content)
 
-        return {
+        payload_dict = {
             "conversation_id": context.conversation_id,
             "created": int(time.time()),
             "seq": seq,
@@ -137,19 +139,35 @@ class ResponseBuilder:
             ],
         }
 
+        event_type = EventType.from_raw(conversation_type)
+        return StreamEvent(
+            conversation_id=context.conversation_id,
+            event_type=event_type,
+            payload=payload_dict,
+            source=payload.response_source,
+            seq=seq,
+        )
+
     def build_cancel(self, conversation_id: str):
-        return {
+        """构造取消事件，用于协调器主动中断时。"""
+        payload = {
             "conversation_id": conversation_id,
-            "type": "cancelled",
+            "type": EventType.CANCELLED.value,
             "object": "realtime.cancelled",
             "created": int(time.time()),
             "message": "Stream cancelled by user",
         }
+        return StreamEvent(
+            conversation_id=conversation_id,
+            event_type=EventType.CANCELLED,
+            payload=payload,
+        )
 
     def build_error(self, conversation_id: str, code: int, message: str, err_type: str):
-        return {
+        """标准化错误信息，便于控制器封装。"""
+        payload = {
             "conversation_id": conversation_id,
-            "type": "error",
+            "type": EventType.ERROR.value,
             "object": "realtime.error",
             "created": int(time.time()),
             "error": [
@@ -160,9 +178,15 @@ class ResponseBuilder:
                 }
             ],
         }
+        return StreamEvent(
+            conversation_id=conversation_id,
+            event_type=EventType.ERROR,
+            payload=payload,
+        )
 
     def build_done(self, conversation_id: str):
-        return {
+        """生成最终 done 事件，通知下游传输层。"""
+        payload = {
             "conversation_id": conversation_id,
             "created": int(time.time()),
             "seq": -1,
@@ -184,3 +208,9 @@ class ResponseBuilder:
                 }
             ],
         }
+        return StreamEvent(
+            conversation_id=conversation_id,
+            event_type=EventType.RESPONSE_DONE,
+            payload=payload,
+            seq=-1,
+        )

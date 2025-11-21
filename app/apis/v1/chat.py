@@ -13,6 +13,9 @@ from app.schemas.chat import ChatV1Request
 from fastapi.responses import StreamingResponse
 from app.core.middleware.auth import auth_dependency
 from app.core.stream_controller import create_cancellable_stream
+from app.core.streaming.cancellation import RequestDisconnectSource
+from app.core.streaming.provider import LangGraphStreamProvider
+from app.core.streaming.transport import SSETransport
 from app.services.response import ResponseCode, get_error_message
 from app.settings import settings
 from app.core.agent_factory.orchestrator import Orchestrator
@@ -21,9 +24,18 @@ from ...core.pg_pool_context_manager import pg_hybrid
 
 
 @router.post("/chat/stream")
-async def stream_chat_v1(request: Request, param: ChatV1Request,
-        user_id: str = Depends(auth_dependency), dependencies=[]):
-    """处理流式聊天请求"""
+async def stream_chat_v1(
+        request: Request,
+        param: ChatV1Request,
+        user_id: str = Depends(auth_dependency)):
+    """
+    处理流式聊天请求，负责初始化线程信息并串联 LangGraph 流。
+
+    Args:
+        request: FastAPI Request，用于检测客户端断连等。
+        param: 聊天请求体，包含 conversation_id、消息内容等。
+        user_id: 通过 auth_dependency 解出的用户 ID。
+    """
     # 新建项目
     if param.type == "create" or param.conversation_id is None:
         conversation_id = str(uuid.uuid4())
@@ -55,12 +67,15 @@ async def stream_chat_v1(request: Request, param: ChatV1Request,
             async with pg_hybrid.context() as checkpointer:
                 # checkpointer = await pg_hybrid.get_saver()
                 agent = await create_chat_agent(checkpointer)
-                original_stream = agent.stream_process(param, config=config)
+                provider = LangGraphStreamProvider(agent, param, config=config)
+                cancel_source = RequestDisconnectSource(request)
+                transport = SSETransport()
 
-                # 包装为可取消的流（5分钟超时）
+                # 包装为可取消的流（10分钟超时）
                 async for chunk in create_cancellable_stream(
-                        conversation_id=param.conversation_id,
-                        original_stream=original_stream,
+                        provider=provider,
+                        transport=transport,
+                        cancel_source=cancel_source,
                         check_interval=0.5,  # 每0.5秒检查一次取消状态
                         timeout_seconds=600,  # 10分钟超时
                         heartbeat_interval=5,  # 每5秒一次心跳
@@ -128,6 +143,13 @@ async def stream_chat_v1(request: Request, param: ChatV1Request,
     )
 
 async def create_chat_agent(checkpointer):
+    """
+    Args:
+        checkpointer: LangGraph 的状态存储，实现对话的断点续传。
+
+    Returns:
+        初始化好 graph 的 Orchestrator。
+    """
     client = MultiServerMCPClient({
         # 高德地图MCP Server
         "amap-amap-sse": {
