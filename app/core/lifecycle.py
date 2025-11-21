@@ -3,9 +3,9 @@ import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-# from motor.motor_asyncio import AsyncIOMotorClient
-#
-# from app.framework.supervisor_manager import supervisor_manager
+from app.core.llm.runtime_manager import LLMRuntimeManager
+from app.core.tools.runtime_manager import ToolRuntimeManager
+from app.settings import settings
 
 SHOULD_EXIT = False
 
@@ -46,9 +46,29 @@ async def lifespan(app: FastAPI):
     # except Exception as e:
     #     raise
 
+    llm_manager = LLMRuntimeManager(
+        default_model=settings.DEEPSEEK_MODEL or settings.DEFAULT_LLM_MODEL or "deepseek:deepseek-reasoner"
+    )
+    app.state.llm_manager = llm_manager
+
+    tool_servers = {}
+    if settings.AMAP_MCP_URI:
+        tool_servers["amap-amap-sse"] = {
+            "url": settings.AMAP_MCP_URI,
+            "transport": "sse",
+        }
+    tool_manager = ToolRuntimeManager(
+        tool_servers,
+        refresh_ttl=settings.TOOL_REFRESH_TTL,
+    )
+    app.state.tool_manager = tool_manager
+
     # ✅ 初始化 AgentPool（可选：预热默认 Agent）
     try:
         # 预热默认 Agent（可选，减少首次请求延迟）
+        await llm_manager.preload()
+        if tool_servers:
+            await tool_manager.preload()
         print("AgentPool initialized and warmed up")
     except Exception as e:
         print(f"Warning: Failed to warm up AgentPool: {e}")
@@ -60,6 +80,8 @@ async def lifespan(app: FastAPI):
 
         # ✅ 清理 AgentPool
         try:
+            await llm_manager.close()
+            await tool_manager.close()
             print("AgentPool cleaned up")
         except Exception as e:
             print(f"Error cleaning up AgentPool: {e}")

@@ -3,7 +3,7 @@ import logging
 from typing import AsyncGenerator, Dict
 
 from langchain.agents import create_agent
-from langchain.chat_models import init_chat_model
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage
 
 from app.core.agent_factory.streaming import (
@@ -14,36 +14,23 @@ from app.core.agent_factory.streaming import (
 from app.core.streaming.events import StreamEvent
 from app.schemas.chat import ChatV1Request
 from app.services.response import ResponseCode, get_error_message
-from app.settings import settings
 
 logger = logging.getLogger(__name__)
 
 
 class Orchestrator:
-    def __init__(self, name, desc):
+    def __init__(self, name, desc, llm: BaseChatModel):
         """
         Args:
             name: 协调器名称，用于日志或可视化展示。
             desc: 协调器描述，帮助外部理解该 orchestrator 的职责。
+            llm: LangChain ChatModel，实现具体推理。
         """
         self.name = name
         self.desc = desc
         self.graph = None
         self.tools = []
-
-        api_key = settings.DEEPSEEK_API_KEY
-        if not api_key:
-            raise ValueError("DEEPSEEK_API_KEY is not configured in environment variables")
-
-        base_url = settings.DEEPSEEK_API_BASE or "https://api.deepseek.com/v1"
-        model_name = settings.DEEPSEEK_MODEL or "deepseek:deepseek-reasoner"
-
-        self.llm = init_chat_model(
-            model=model_name,
-            temperature=0,
-            base_url=base_url,
-            api_key=api_key,
-        )
+        self.llm = llm
 
         self._message_adapter = LangGraphMessageAdapter()
         self._response_builder = ResponseBuilder()

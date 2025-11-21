@@ -45,6 +45,7 @@ class Settings:
     REDIS_PASSWORD: str = os.getenv("REDIS_PASSWORD", "admin")
 
     AMAP_MCP_URI: str = os.getenv("AMAP_MCP_URI", "")
+    TOOL_REFRESH_TTL: int = int(os.getenv("TOOL_REFRESH_TTL", 300))
 
 
 settings = Settings()

@@ -7,8 +7,6 @@ from typing import AsyncGenerator
 
 from fastapi import Depends
 from fastapi import Request
-from langchain_mcp_adapters.client import MultiServerMCPClient
-
 from app.schemas.chat import ChatV1Request
 from fastapi.responses import StreamingResponse
 from app.core.middleware.auth import auth_dependency
@@ -19,6 +17,8 @@ from app.core.streaming.transport import SSETransport
 from app.services.response import ResponseCode, get_error_message
 from app.settings import settings
 from app.core.agent_factory.orchestrator import Orchestrator
+from app.core.llm.runtime_manager import LLMRuntimeManager
+from app.core.tools.runtime_manager import ToolRuntimeManager
 from . import router
 from ...core.pg_pool_context_manager import pg_hybrid
 
@@ -66,7 +66,20 @@ async def stream_chat_v1(
         try:
             async with pg_hybrid.context() as checkpointer:
                 # checkpointer = await pg_hybrid.get_saver()
-                agent = await create_chat_agent(checkpointer)
+                llm_manager: LLMRuntimeManager = getattr(request.app.state, "llm_manager", None)
+                if llm_manager is None:
+                    raise RuntimeError("LLM manager is not initialized")
+                tool_manager: ToolRuntimeManager = getattr(request.app.state, "tool_manager", None)
+                if tool_manager is None:
+                    raise RuntimeError("Tool manager is not initialized")
+
+                model_id = str(param.model) if param.model is not None else None
+                agent = await create_chat_agent(
+                    checkpointer,
+                    llm_manager,
+                    tool_manager,
+                    model_id=model_id,
+                )
                 provider = LangGraphStreamProvider(agent, param, config=config)
                 cancel_source = RequestDisconnectSource(request)
                 transport = SSETransport()
@@ -142,27 +155,26 @@ async def stream_chat_v1(
         media_type="text/event-stream"
     )
 
-async def create_chat_agent(checkpointer):
+async def create_chat_agent(
+        checkpointer,
+        llm_manager: LLMRuntimeManager,
+        tool_manager: ToolRuntimeManager,
+        model_id: str | None = None):
     """
     Args:
         checkpointer: LangGraph 的状态存储，实现对话的断点续传。
+        llm_manager: 负责生成/复用 LLM 的运行时管理器。
+        tool_manager: 缓存工具集合的运行时管理器。
+        model_id: 可选的模型标识，覆盖默认模型。
 
     Returns:
         初始化好 graph 的 Orchestrator。
     """
-    client = MultiServerMCPClient({
-        # 高德地图MCP Server
-        "amap-amap-sse": {
-            "url": settings.AMAP_MCP_URI,
-            "transport": "sse",
-        }
-    })
-
-    # 从MCP Server中获取可提供使用的全部工具
-    tools = await client.get_tools()
+    tools = await tool_manager.get_tools()
+    llm = await llm_manager.get_llm(model_id=model_id)
 
     system_message = "你是一个AI助手，使用高德地图工具集合获取信息，以及给出方案。"
-    orchtor = Orchestrator("指挥官", "调度整个会话与流程")
+    orchtor = Orchestrator("指挥官", "调度整个会话与流程", llm)
     orchtor.register_tool(tools)
 
 
